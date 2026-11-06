@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  auth:
+    image: ds-auth:latest
+    ports:
+      - "7001:7000"
+    environment:
+      - DS_AUTH_MODE=local
+      - SSO_LOGIN_URL=/auth/oauth2/start?rd=/auth/sso/callback
+      - SSO_POST_LOGIN_REDIRECT_URL=/
+      - COOKIE_SECURE=true
+      - SSO_DEBUG=false
+      - JWT_EXP_MIN=480
+      - DS_AUTH_DEV_LOCALHOST_SSO_FRAGMENT=1
+      - DS_API_BASE_URL=http://ds_dbapi:3000
+      - CORS_ALLOW_ORIGIN=
+    networks:
+      - backend
+    secrets:
+      - aeskey
+      - aesiv
+      - auth_public_key
+      - auth_private_key
+      - repository_host
+      - repository_port
+      - repository_name
+      - repository_username
+      - repository_password_encrypt
+    deploy: {}
+
+
+networks:
+  backend:
+    external: true
+
+secrets:
+  aeskey:
+    external: true
+  aesiv:
+    external: true
+  repository_host:
+    external: true
+  repository_port:
+    external: true
+  repository_name:
+    external: true
+  repository_username:
+    external: true
+  repository_password_encrypt:
+    external: true
+  auth_private_key:
+    external: true
+  auth_public_key:
+    external: true
+
+
