@@ -2,19 +2,21 @@ version: '3.8'
 
 services:
   auth:
-    image: ds-auth:latest
+    image: ${DS_AUTH_IMAGE:-ds-auth:latest}
     ports:
-      - "7001:7000"
+      - "${DS_AUTH_PORT:-7001}:7000"
+    # Values are substituted from .env at deploy time (see "Deploy" note in README).
+    # Only non-secret settings are passed through; Azure/cookie secrets are NOT.
     environment:
-      - DS_AUTH_MODE=local
-      - SSO_LOGIN_URL=/auth/oauth2/start?rd=/auth/sso/callback
-      - SSO_POST_LOGIN_REDIRECT_URL=/
-      - COOKIE_SECURE=true
-      - SSO_DEBUG=false
-      - JWT_EXP_MIN=480
-      - DS_AUTH_DEV_LOCALHOST_SSO_FRAGMENT=1
-      - DS_API_BASE_URL=http://ds_dbapi:3000
-      - CORS_ALLOW_ORIGIN=
+      - DS_AUTH_MODE=${DS_AUTH_MODE:-local}
+      - SSO_LOGIN_URL=${SSO_LOGIN_URL:-/auth/oauth2/start?rd=/auth/sso/callback}
+      - SSO_POST_LOGIN_REDIRECT_URL=${SSO_POST_LOGIN_REDIRECT_URL:-/}
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      - SSO_DEBUG=${SSO_DEBUG:-false}
+      - JWT_EXP_MIN=${JWT_EXP_MIN:-480}
+      - DS_AUTH_DEV_LOCALHOST_SSO_FRAGMENT=${DS_AUTH_DEV_LOCALHOST_SSO_FRAGMENT:-}
+      - DS_API_BASE_URL=${DS_API_BASE_URL:-http://ds_dbapi:3000}
+      - CORS_ALLOW_ORIGIN=${CORS_ALLOW_ORIGIN:-}
     networks:
       - backend
     secrets:
@@ -25,8 +27,8 @@ services:
       - repository_host
       - repository_port
       - repository_name
-      - repository_username
-      - repository_password_encrypt
+      - auth_repository_username
+      - auth_repository_password_encrypt
     deploy: {}
 
 
@@ -43,11 +45,16 @@ secrets:
     external: true
   repository_port:
     external: true
+  # Host/port/name come from the shared repository_* secrets. The shared
+  # repository_name still holds the legacy name, so it is mapped to the
+  # ds_auth_repository_name secret (data_sentinel) until the shared one is fixed.
   repository_name:
     external: true
-  repository_username:
+    name: ds_auth_repository_name
+  # ds-auth's own database credential (read as auth_repository_* by the app).
+  auth_repository_username:
     external: true
-  repository_password_encrypt:
+  auth_repository_password_encrypt:
     external: true
   auth_private_key:
     external: true

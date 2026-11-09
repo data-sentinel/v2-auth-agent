@@ -24,7 +24,7 @@ Common:
 # global_app_version = '2024.51.01'    # Initial Version
 # global_app_version = '2024.51.02'    # Updated to use private pem from DS SECRETS
 global_app_version = '2026.45.01'    # Login stamp for the activity log; application_name on the DB pool
-global_app_version = '2026.45.02'    # v2: sys_verify_login, SSO errors redirect to /login, COOKIE_SECURE, DS_AUTH_MODE, no stamp_login
+global_app_version = '2026.45.03'    # SSO accounts matched on email, /secrets-test only under SSO_DEBUG, own auth_repository_* DB credential
 
 
 # Base imports
@@ -171,11 +171,12 @@ try:
     env_repo_host = get_secret("repository_host")
     env_repo_port = get_secret("repository_port")
     env_repo_db = get_secret("repository_name")
-    env_repo_user = get_secret("repository_username")
-    env_repo_pswd = get_encrypted_secret("repository_password_encrypt")
+    # ds-auth has its own database credential (no fallback to the shared one).
+    env_repo_user = get_secret("auth_repository_username")
+    env_repo_pswd = get_encrypted_secret("auth_repository_password_encrypt")
 
     if not all([env_repo_host, env_repo_port, env_repo_db, env_repo_user]) or env_repo_pswd is False:
-        raise RuntimeError("One or more repository_* secrets are missing or invalid in /run/secrets/.")
+        raise RuntimeError("One or more repository_* / auth_repository_* secrets are missing or invalid in /run/secrets/.")
 
     global_status["secrets_loaded"] = "SUCCESS"
     global_status["database_info"] = (
@@ -913,12 +914,27 @@ def _sso_error(key: str):
 _USER_COLUMNS = "user_id, user_name, user_desc, user_access, delete_dt"
 
 
-async def _fetch_user_by_name(username: str):
+async def _fetch_user_by_email(email: str):
+    """SSO accounts are matched on the full email address (user_email)."""
     async with global_conn_pool.acquire() as conn:
         return await conn.fetchrow(
-            f"SELECT {_USER_COLUMNS} FROM sentinel.user_accounts WHERE LOWER(user_name) = LOWER($1)",
-            username,
+            f"SELECT {_USER_COLUMNS} FROM sentinel.user_accounts WHERE lower(user_email) = lower($1)",
+            email,
         )
+
+
+async def _new_sso_user_name(email: str) -> str:
+    """
+    User name for a new SSO account: the part of the email before the '@' if no
+    account already has that name, otherwise the whole email (lower-cased).
+    """
+    candidate = email.split("@", 1)[0]
+    async with global_conn_pool.acquire() as conn:
+        taken = await conn.fetchval(
+            "SELECT 1 FROM sentinel.user_accounts WHERE lower(user_name) = lower($1)",
+            candidate,
+        )
+    return email.lower() if taken else candidate
 
 
 @app.get("/sso/callback")
@@ -942,9 +958,6 @@ async def auth_sso_callback():
     if not email:
         return _sso_error("no_identity")
 
-    # Local username = left-hand part of the email.
-    username = email.split("@", 1)[0]
-
     if global_conn_pool is None:
         return _sso_error("service_error")
 
@@ -955,50 +968,57 @@ async def auth_sso_callback():
         or ""
     )
 
-    # --- Step 1: look up user ---
+    # --- Step 1: look up user (by full SSO email) ---
     try:
-        user_row = await _fetch_user_by_name(username)
+        user_row = await _fetch_user_by_email(email)
     except Exception as exc:
         logger(f"auth_sso_callback|DB lookup error: {exc}", "error", "worker_scope")
         return _sso_error("service_error")
 
     # --- Step 2: reject deactivated accounts BEFORE any role sync ---
     if user_row is not None and user_row["delete_dt"] is not None:
-        logger(f"auth_sso_callback|Deactivated account '{username}'", "warning", "worker_scope")
+        logger(f"auth_sso_callback|Deactivated account '{email}'", "warning", "worker_scope")
         return _sso_error("inactive")
 
     sso_role = _determine_sso_role(auth_header, groups_header)
 
     if user_row is None:
         # --- Step 3: auto-provision ---
+        # user_name = part before the '@' unless an account already has it,
+        # else the whole email. user_email always stays the full email.
+        try:
+            username = await _new_sso_user_name(email)
+        except Exception as exc:
+            logger(f"auth_sso_callback|DB user-name check error: {exc}", "error", "worker_scope")
+            return _sso_error("service_error")
         display_name = (
             request.headers.get("X-Forwarded-Preferred-Username")
             or request.headers.get("X-Auth-Request-User")
             or username
         )
         logger(
-            f"auth_sso_callback|User '{username}' not in DS DB — provisioning (role: {sso_role})",
+            f"auth_sso_callback|User '{email}' not in DS DB — provisioning as '{username}' (role: {sso_role})",
             "info",
             "worker_scope",
         )
         provision_result = await provision_sso_user(username, email, display_name, sso_role)
         if not provision_result.get("success"):
             logger(
-                f"auth_sso_callback|Provisioning failed for '{username}': {provision_result.get('error')}",
+                f"auth_sso_callback|Provisioning failed for '{email}': {provision_result.get('error')}",
                 "error",
                 "worker_scope",
             )
             return _sso_error("provisioning_failed")
 
         try:
-            user_row = await _fetch_user_by_name(username)
+            user_row = await _fetch_user_by_email(email)
         except Exception as exc:
             logger(f"auth_sso_callback|DB re-fetch error: {exc}", "error", "worker_scope")
             return _sso_error("service_error")
 
         if user_row is None:
             logger(
-                f"auth_sso_callback|User '{username}' still not found after provisioning",
+                f"auth_sso_callback|User '{email}' still not found after provisioning",
                 "error",
                 "worker_scope",
             )
@@ -1010,12 +1030,12 @@ async def auth_sso_callback():
         db_role = _infer_role_from_access(user_row["user_access"])
         if sso_role != db_role:
             logger(
-                f"auth_sso_callback|Role change detected for '{username}': "
+                f"auth_sso_callback|Role change detected for '{email}': "
                 f"DB='{db_role}' → Azure='{sso_role}'. Updating user_access...",
                 "info",
                 "worker_scope",
             )
-            if await sync_sso_user_role(user_row["user_id"], username, sso_role):
+            if await sync_sso_user_role(user_row["user_id"], user_row["user_name"], sso_role):
                 try:
                     async with global_conn_pool.acquire() as conn:
                         user_row = await conn.fetchrow(
@@ -1240,53 +1260,55 @@ async def health():
     return jsonify({"status": "ok"})
 
 
-@app.get("/secrets-test")
-async def secrets_test():
-    """
-    Test endpoint to verify secret loading and password decryption.
-    """
-    try:
-        # Test reading secrets
-        aes_key = get_secret("aeskey")
-        aes_iv = get_secret("aesiv")
-        repo_host = get_secret("repository_host")
-        repo_port = get_secret("repository_port")
-        repo_name = get_secret("repository_name")
-        repo_user = get_secret("repository_username")
-        
-        # Test password decryption
-        decrypted_password = get_encrypted_secret("repository_password_encrypt")
-        
-        # Test JWT keys
+if SSO_DEBUG:
+    @app.get("/secrets-test")
+    async def secrets_test():
+        """
+        DEBUG ONLY (SSO_DEBUG=true; off by default). Verifies secret loading and
+        password decryption; unauthenticated, so never enable in production.
+        """
         try:
-            private_key = get_raw_secret("auth_private_key")
-            public_key = get_raw_secret("auth_public_key")
-            jwt_keys_loaded = bool(private_key and public_key)
-        except Exception:
-            jwt_keys_loaded = False
+            # Test reading secrets
+            aes_key = get_secret("aeskey")
+            aes_iv = get_secret("aesiv")
+            repo_host = get_secret("repository_host")
+            repo_port = get_secret("repository_port")
+            repo_name = get_secret("repository_name")
+            repo_user = get_secret("auth_repository_username")
+        
+            # Test password decryption
+            decrypted_password = get_encrypted_secret("auth_repository_password_encrypt")
+        
+            # Test JWT keys
+            try:
+                private_key = get_raw_secret("auth_private_key")
+                public_key = get_raw_secret("auth_public_key")
+                jwt_keys_loaded = bool(private_key and public_key)
+            except Exception:
+                jwt_keys_loaded = False
             
-        return jsonify({
-            "secrets_status": "loaded",
-            "aes_key_loaded": bool(aes_key),
-            "aes_iv_loaded": bool(aes_iv),
-            "repository_secrets": {
-                "host": bool(repo_host),
-                "port": bool(repo_port),
-                "name": bool(repo_name), 
-                "user": bool(repo_user),
-                "password_decrypted": bool(decrypted_password)
-            },
-            "jwt_keys_loaded": jwt_keys_loaded,
-            "database_config": {
-                "host": str(repo_host) if repo_host else None,
-                "port": str(repo_port) if repo_port else None,
-                "name": str(repo_name) if repo_name else None,
-                "user": str(repo_user) if repo_user else None,
-                "password_length": len(str(decrypted_password)) if decrypted_password else 0
-            }
-        })
-    except Exception as e:
-        return jsonify({"error": str(e), "secrets_status": "failed"}), 500
+            return jsonify({
+                "secrets_status": "loaded",
+                "aes_key_loaded": bool(aes_key),
+                "aes_iv_loaded": bool(aes_iv),
+                "repository_secrets": {
+                    "host": bool(repo_host),
+                    "port": bool(repo_port),
+                    "name": bool(repo_name), 
+                    "user": bool(repo_user),
+                    "password_decrypted": bool(decrypted_password)
+                },
+                "jwt_keys_loaded": jwt_keys_loaded,
+                "database_config": {
+                    "host": str(repo_host) if repo_host else None,
+                    "port": str(repo_port) if repo_port else None,
+                    "name": str(repo_name) if repo_name else None,
+                    "user": str(repo_user) if repo_user else None,
+                    "password_length": len(str(decrypted_password)) if decrypted_password else 0
+                }
+            })
+        except Exception as e:
+            return jsonify({"error": str(e), "secrets_status": "failed"}), 500
 
 
 # ---------------------------------------------------------------------------
